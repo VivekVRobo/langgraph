@@ -27,7 +27,7 @@ from langgraph._internal._constants import (
 )
 from langgraph.func import entrypoint, task
 from langgraph.graph import END, START, StateGraph
-from langgraph.pregel._task_status import read_task_statuses
+from langgraph.pregel._task_status import read_pending_interrupts, read_task_statuses
 from langgraph.types import Command, Durability, Interrupt, Send, interrupt
 
 pytestmark = pytest.mark.anyio
@@ -437,6 +437,97 @@ def test_parallel_subgraphs_report_only_pending_interrupts(
     assert sorted(result["answers"]) == ["x", "y"]
 
 
+def test_parallel_functional_tasks_surface_all_interrupts(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    @task
+    def ask(prompt: str) -> str:
+        return interrupt(prompt)
+
+    @entrypoint(checkpointer=sync_checkpointer)
+    def workflow(_: Any) -> list[str]:
+        futures = [ask(prompt) for prompt in ("A", "B", "C")]
+        return [future.result() for future in futures]
+
+    config = _config()
+
+    result = workflow.invoke(1, config)
+    assert "__interrupt__" in result
+    assert sorted(_interrupt_values(result["__interrupt__"])) == ["A", "B", "C"]
+    assert len({interrupt.id for interrupt in result["__interrupt__"]}) == 3
+
+    snapshot = workflow.get_state(config)
+    assert sorted(_interrupt_values(snapshot.interrupts)) == ["A", "B", "C"]
+    assert len({interrupt.id for interrupt in snapshot.interrupts}) == 3
+
+    with pytest.raises(RuntimeError, match="multiple pending interrupts"):
+        workflow.invoke(Command(resume="ambiguous"), config)
+
+    first = _interrupt_by_value(snapshot, "A")
+    partial = workflow.invoke(Command(resume={first.id: "A-answer"}), config)
+    assert "__interrupt__" in partial
+    assert sorted(_interrupt_values(partial["__interrupt__"])) == ["B", "C"]
+
+    snapshot = workflow.get_state(config)
+    assert sorted(_interrupt_values(snapshot.interrupts)) == ["B", "C"]
+
+    resume = {
+        interrupt.id: f"{interrupt.value}-answer"
+        for interrupt in snapshot.interrupts
+    }
+    assert workflow.invoke(Command(resume=resume), config) == [
+        "A-answer",
+        "B-answer",
+        "C-answer",
+    ]
+
+
+@NEEDS_CONTEXTVARS
+async def test_parallel_functional_tasks_surface_all_interrupts_async(
+    async_checkpointer: BaseCheckpointSaver,
+) -> None:
+    @task
+    async def ask(prompt: str) -> str:
+        return interrupt(prompt)
+
+    @entrypoint(checkpointer=async_checkpointer)
+    async def workflow(_: Any) -> list[str]:
+        futures = [ask(prompt) for prompt in ("A", "B", "C")]
+        return [await future for future in futures]
+
+    config = _config()
+
+    result = await workflow.ainvoke(1, config)
+    assert "__interrupt__" in result
+    assert sorted(_interrupt_values(result["__interrupt__"])) == ["A", "B", "C"]
+    assert len({interrupt.id for interrupt in result["__interrupt__"]}) == 3
+
+    snapshot = await workflow.aget_state(config)
+    assert sorted(_interrupt_values(snapshot.interrupts)) == ["A", "B", "C"]
+    assert len({interrupt.id for interrupt in snapshot.interrupts}) == 3
+
+    with pytest.raises(RuntimeError, match="multiple pending interrupts"):
+        await workflow.ainvoke(Command(resume="ambiguous"), config)
+
+    first = _interrupt_by_value(snapshot, "A")
+    partial = await workflow.ainvoke(Command(resume={first.id: "A-answer"}), config)
+    assert "__interrupt__" in partial
+    assert sorted(_interrupt_values(partial["__interrupt__"])) == ["B", "C"]
+
+    snapshot = await workflow.aget_state(config)
+    assert sorted(_interrupt_values(snapshot.interrupts)) == ["B", "C"]
+
+    resume = {
+        interrupt.id: f"{interrupt.value}-answer"
+        for interrupt in snapshot.interrupts
+    }
+    assert await workflow.ainvoke(Command(resume=resume), config) == [
+        "A-answer",
+        "B-answer",
+        "C-answer",
+    ]
+
+
 def test_functional_task_finished_with_none_is_not_rerun(
     sync_checkpointer: BaseCheckpointSaver,
 ) -> None:
@@ -532,3 +623,21 @@ def test_read_task_statuses() -> None:
 
     assert not statuses["failed"].finished
     assert statuses["failed"].error is error
+
+
+def test_read_pending_interrupts_filters_and_deduplicates() -> None:
+    a = Interrupt(value="A", id="a")
+    b = Interrupt(value="B", id="b")
+    unrelated = Interrupt(value="unrelated", id="other")
+
+    writes = [
+        ("parent", INTERRUPT, (a, b)),
+        ("child-a", INTERRUPT, (a,)),
+        ("child-b", INTERRUPT, (b,)),
+        ("unrelated", INTERRUPT, (unrelated,)),
+    ]
+
+    assert read_pending_interrupts(
+        writes, task_ids={"parent", "child-a", "child-b"}
+    ) == (a, b)
+    assert read_pending_interrupts(writes) == (a, b, unrelated)
