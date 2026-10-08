@@ -51,7 +51,7 @@ What these rules cannot see:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,7 +66,12 @@ from langgraph._internal._constants import (
 )
 from langgraph.types import Interrupt
 
-__all__ = ("CONTROL_WRITES", "TaskStatus", "read_task_statuses")
+__all__ = (
+    "CONTROL_WRITES",
+    "TaskStatus",
+    "read_pending_interrupts",
+    "read_task_statuses",
+)
 
 CONTROL_WRITES = frozenset((ERROR, ERROR_SOURCE_NODE, INTERRUPT, RESUME))
 """Channels that describe what happened to a task rather than what it produced."""
@@ -127,3 +132,28 @@ def read_task_statuses(
         )
         for task_id, task_output in output.items()
     }
+
+
+def read_pending_interrupts(
+    pending_writes: Iterable[PendingWrite],
+    *,
+    task_ids: Collection[str] | None = None,
+) -> tuple[Interrupt, ...]:
+    """Return unique interrupts that are still waiting for an answer.
+
+    Interrupts raised by Functional API child tasks are also recorded on their
+    parent task. Deduplicate by interrupt id while preserving the order in
+    which task writes first appeared.
+    """
+    seen: set[str] = set()
+    pending: list[Interrupt] = []
+    for task_id, status in read_task_statuses(pending_writes).items():
+        if task_ids is not None and task_id not in task_ids:
+            continue
+        for interrupt in status.pending_interrupts:
+            if interrupt.id in seen:
+                continue
+            seen.add(interrupt.id)
+            pending.append(interrupt)
+    return tuple(pending)
+

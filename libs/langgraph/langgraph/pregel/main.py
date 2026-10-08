@@ -156,7 +156,7 @@ from langgraph.pregel._messages import (
 from langgraph.pregel._read import DEFAULT_BOUND, PregelNode
 from langgraph.pregel._retry import RetryPolicy
 from langgraph.pregel._runner import PregelRunner
-from langgraph.pregel._task_status import read_task_statuses
+from langgraph.pregel._task_status import read_pending_interrupts, read_task_statuses
 from langgraph.pregel._tools import StreamToolCallHandler
 from langgraph.pregel._utils import (
     get_new_channel_versions,
@@ -1330,7 +1330,11 @@ class Pregel(
             saved.checkpoint["ts"],
             patch_checkpoint_map(saved.parent_config, saved.metadata),
             tasks_with_writes,
-            tuple([i for task in tasks_with_writes for i in task.interrupts]),
+            (
+                read_pending_interrupts(saved.pending_writes or [])
+                if live
+                else tuple(i for task in tasks_with_writes for i in task.interrupts)
+            ),
         )
 
     async def _aprepare_state_snapshot(
@@ -1456,7 +1460,11 @@ class Pregel(
             saved.checkpoint["ts"],
             patch_checkpoint_map(saved.parent_config, saved.metadata),
             tasks_with_writes,
-            tuple([i for task in tasks_with_writes for i in task.interrupts]),
+            (
+                read_pending_interrupts(saved.pending_writes or [])
+                if live
+                else tuple(i for task in tasks_with_writes for i in task.interrupts)
+            ),
         )
 
     def get_state(

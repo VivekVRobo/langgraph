@@ -123,7 +123,7 @@ from langgraph.pregel._io import (
 )
 from langgraph.pregel._messages import ensure_message_ids
 from langgraph.pregel._read import PregelNode
-from langgraph.pregel._task_status import read_task_statuses
+from langgraph.pregel._task_status import read_pending_interrupts, read_task_statuses
 from langgraph.pregel._utils import get_new_channel_versions, is_xxh3_128_hexdigest
 from langgraph.pregel.debug import (
     map_debug_checkpoint,
@@ -878,8 +878,7 @@ class PregelLoop:
         """Return the ids of interrupts that are still waiting for an answer."""
         return {
             interrupt.id
-            for status in read_task_statuses(self.checkpoint_pending_writes).values()
-            for interrupt in status.pending_interrupts
+            for interrupt in read_pending_interrupts(self.checkpoint_pending_writes)
         }
 
     def _first(
@@ -1539,16 +1538,25 @@ class PregelLoop:
                 # we don't emit the interrupt as it'll be emitted by the parent
                 if task.path[0] == PUSH and task.path[-1] is True:
                     return
-                interrupts = [
-                    {
-                        INTERRUPT: tuple(
-                            v
-                            for w in writes
-                            if w[0] == INTERRUPT
-                            for v in (w[1] if isinstance(w[1], Sequence) else (w[1],))
-                        )
-                    }
-                ]
+                interrupt_values = tuple(
+                    v
+                    for w in writes
+                    if w[0] == INTERRUPT
+                    for v in (w[1] if isinstance(w[1], Sequence) else (w[1],))
+                )
+                functional_child_ids = {
+                    child.id
+                    for child in self.tasks.values()
+                    if child.path[0] == PUSH
+                    and child.path[-1] is True
+                    and child.path[1] == task.path
+                }
+                if functional_child_ids:
+                    interrupt_values = read_pending_interrupts(
+                        self.checkpoint_pending_writes,
+                        task_ids={task.id, *functional_child_ids},
+                    )
+                interrupts = [{INTERRUPT: interrupt_values}]
                 stream_modes = self.stream.modes if self.stream else []
                 if "updates" in stream_modes:
                     self._emit("updates", lambda: iter(interrupts))
